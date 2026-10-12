@@ -75,6 +75,8 @@ type AssignmentResponse = Result<Vec<assignment::Assignment>, ServerFnError>;
 type ProjectDetailsResponse = Result<project::ProjectDetails, ServerFnError>;
 type DeferredResponse<T> = Rc<RefCell<Option<oneshot::Receiver<Result<T, ServerFnError>>>>>;
 
+#[path = "detail_navigation/clients.rs"]
+mod client_tests;
 #[path = "detail_navigation/detail.rs"]
 mod detail_tests;
 #[path = "detail_navigation/overview.rs"]
@@ -87,6 +89,15 @@ type ProjectSpendResponse = Result<Vec<server_fns::ProjectSpend>, ServerFnError>
 #[derive(Clone, Default)]
 struct Probe {
     member: bool,
+    canonical: bool,
+    /// Opt-in for tests that refresh Clients through a status change; every
+    /// other navigation mutation stays fail-fast.
+    allow_client_activity: bool,
+    client_overview_requests: Rc<RefCell<Vec<Option<permission_editor::PermissionRequester>>>>,
+    client_overview_response: DeferredResponse<client::ClientOverview>,
+    client_view_requests: Rc<RefCell<Vec<Option<permission_editor::PermissionRequester>>>>,
+    client_view_response: DeferredResponse<client::ClientDetailView>,
+    client_status_changes: Rc<RefCell<Vec<(Uuid, bool)>>>,
     client_requests: Rc<RefCell<Vec<Uuid>>>,
     client_invoice_requests: Rc<RefCell<Vec<Uuid>>>,
     client_response: Rc<RefCell<Option<oneshot::Receiver<ClientDetailsResponse>>>>,
@@ -808,10 +819,6 @@ fn is_admin(me: &Resource<Result<user::CurrentUser, ServerFnError>>) -> bool {
     matches!(&*me.read(), Some(Ok(user)) if user.is_admin())
 }
 
-fn is_manager(me: &Resource<Result<user::CurrentUser, ServerFnError>>) -> bool {
-    matches!(&*me.read(), Some(Ok(user)) if user.is_manager_or_above())
-}
-
 fn loaded<T>(
     state: &Option<Result<T, ServerFnError>>,
     render: impl FnOnce(&T) -> Element,
@@ -823,13 +830,27 @@ fn loaded<T>(
     }
 }
 
+// Mirrors the production helper only for tests that opt into client activity.
 fn run_action<O: 'static, T: 'static>(
-    _future: impl std::future::Future<Output = Result<O, ServerFnError>> + 'static,
-    _resource: Resource<T>,
-    _error: Signal<Option<String>>,
-    _on_ok: impl FnOnce() + 'static,
+    future: impl std::future::Future<Output = Result<O, ServerFnError>> + 'static,
+    mut resource: Resource<T>,
+    mut error: Signal<Option<String>>,
+    on_ok: impl FnOnce() + 'static,
 ) {
-    panic!("navigation must not trigger a mutation");
+    assert!(
+        consume_context::<Probe>().allow_client_activity,
+        "navigation must not trigger a mutation"
+    );
+    spawn(async move {
+        match future.await {
+            Ok(_) => {
+                error.set(None);
+                on_ok();
+                resource.restart();
+            }
+            Err(problem) => error.set(Some(problem.to_string())),
+        }
+    });
 }
 
 mod server_fns {
@@ -908,8 +929,34 @@ mod server_fns {
         Ok(vec![invoice])
     }
 
-    pub async fn list_client_summaries() -> Result<Vec<client::ClientSummary>, ServerFnError> {
-        Ok(Vec::new())
+    pub async fn client_overview(
+        expected: Option<permission_editor::PermissionRequester>,
+    ) -> Result<client::ClientOverview, ServerFnError> {
+        let probe = consume_context::<Probe>();
+        probe.client_overview_requests.borrow_mut().push(expected);
+        let response = probe.client_overview_response.borrow_mut().take();
+        if let Some(response) = response {
+            return response.await.unwrap();
+        }
+        Ok(super::client_tests::overview(&probe))
+    }
+
+    pub async fn client_detail_view(
+        id: String,
+        expected: Option<permission_editor::PermissionRequester>,
+    ) -> Result<client::ClientDetailView, ServerFnError> {
+        let probe = consume_context::<Probe>();
+        probe.client_view_requests.borrow_mut().push(expected);
+        let response = probe.client_view_response.borrow_mut().take();
+        if let Some(response) = response {
+            return response.await.unwrap();
+        }
+        Ok(client::ClientDetailView {
+            requester: super::client_tests::requester(),
+            canonical_permissions: probe.canonical,
+            can_manage: !probe.member && !probe.canonical,
+            details: get_client_details(id).await?,
+        })
     }
     pub async fn create_client_profile(
         _profile: client::ClientProfile,
@@ -923,8 +970,19 @@ mod server_fns {
     ) -> ClientDetailsResponse {
         panic!("navigation must not edit clients");
     }
-    pub async fn set_client_active(_id: String, _active: bool) -> Result<Client, ServerFnError> {
-        panic!("navigation must not change client status");
+    pub async fn set_client_active(id: String, active: bool) -> Result<Client, ServerFnError> {
+        let id = Uuid::parse_str(&id).unwrap();
+        let probe = consume_context::<Probe>();
+        assert!(
+            probe.allow_client_activity,
+            "navigation must not change client status"
+        );
+        assert!(
+            !probe.member && !probe.canonical,
+            "only legacy managers may change client status"
+        );
+        probe.client_status_changes.borrow_mut().push((id, active));
+        Ok(super::client_tests::client_record(id))
     }
 
     pub async fn list_assignments(

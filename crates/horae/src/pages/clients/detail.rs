@@ -3,6 +3,7 @@ use horae_core::{duration::format_hhmm, money::format_cents};
 use uuid::Uuid;
 
 use crate::components::{badge::Badge, icons::NavIcon};
+use crate::models::client::ClientDetailView;
 use crate::route::Route;
 use crate::server_fns;
 
@@ -15,10 +16,31 @@ pub fn ClientDetail(id: Uuid) -> Element {
 #[component]
 fn ClientDetailContent(id: Uuid) -> Element {
     let mut show_editor = use_signal(|| false);
-    let mut details =
-        use_resource(move || async move { server_fns::get_client_details(id.to_string()).await });
+    let binding = use_signal(|| None::<super::Binding>);
+    let mut details = use_resource(move || async move {
+        // An editor opened under the previous authority must not survive a refresh.
+        show_editor.set(false);
+        let expected = binding.peek().as_ref().map(|(requester, _)| *requester);
+        let view = server_fns::client_detail_view(id.to_string(), expected).await?;
+        super::bind(binding, (view.requester, view.canonical_permissions))?;
+        Ok::<_, ServerFnError>(view)
+    });
+    let mut refocus_edit = use_signal(|| false);
+    use_effect(move || {
+        if details.state()() != UseResourceState::Ready {
+            return;
+        }
+        // One-shot: a failed, denied or rebound reload consumes it without focusing.
+        if refocus_edit.take() && matches!(&*details.peek(), Some(Ok(view)) if view.can_manage) {
+            super::restore_opener_focus("client-edit", "client-back");
+        }
+    });
     let ready = details.state()() == UseResourceState::Ready;
     let data = details.read();
+    // Legacy-only until client writes and invoices use canonical permissions;
+    // billing visibility is a separate grant and never implies management.
+    // A reloading resource keeps its previous value, so require a settled one.
+    let can_manage = ready && matches!(&*data, Some(Ok(view)) if view.can_manage);
 
     rsx! {
         div { class: "client-detail min-w-0",
@@ -28,7 +50,7 @@ fn ClientDetailContent(id: Uuid) -> Element {
             }
             if !ready {
                 p { role: "status", aria_busy: "true", "Loading client…" }
-            } else if let Some(Ok(detail)) = &*data {
+            } else if let Some(Ok(ClientDetailView { details: detail, .. })) = &*data {
                 div { class: "page-header border-b pb-6 mb-4",
                     div { class: "min-w-0",
                         p { class: "text-xs text-secondary m-0 mb-2",
@@ -44,13 +66,13 @@ fn ClientDetailContent(id: Uuid) -> Element {
                             if !detail.client.active { Badge { variant: "neutral", "Inactive" } }
                         }
                     }
-                    if detail.billing.is_some() {
+                    if can_manage {
                         div { class: "page-actions",
                             if detail.client.active {
                                 Link { to: Route::NewProjectForClient { client: id.to_string() }, class: "btn btn-secondary", "New project" }
                                 Link { to: Route::NewInvoiceForClient { client: id.to_string() }, class: "btn btn-primary", "New invoice" }
                             }
-                            button { r#type: "button", class: "btn btn-secondary", onclick: move |_| show_editor.set(true), "Edit client" }
+                            button { id: "client-edit", r#type: "button", class: "btn btn-secondary", onclick: move |_| show_editor.set(true), "Edit client" }
                         }
                     }
                 }
@@ -81,7 +103,7 @@ fn ClientDetailContent(id: Uuid) -> Element {
                                 }
                             }
                         }
-                        if detail.billing.is_some() { ClientInvoices { client_id: id } }
+                        if can_manage { ClientInvoices { client_id: id } }
                     }
                 }
             } else {
@@ -91,9 +113,13 @@ fn ClientDetailContent(id: Uuid) -> Element {
                         onclick: move |_| details.restart(), "Retry client" }
                 }
             }
-            super::form::ClientEditor { open: show_editor(), client_id: Some(id), focus_fallback: "client-back",
+            super::form::ClientEditor { open: show_editor() && can_manage, client_id: Some(id), focus_fallback: "client-back",
                 on_dismiss: move |_| show_editor.set(false),
-                on_saved: move |_| { show_editor.set(false); details.restart(); },
+                on_saved: move |_| {
+                    refocus_edit.set(true);
+                    show_editor.set(false);
+                    details.restart();
+                },
             }
         }
     }

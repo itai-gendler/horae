@@ -2,10 +2,11 @@ use dioxus::prelude::*;
 use std::collections::BTreeSet;
 use uuid::Uuid;
 
-use super::{is_admin, is_manager, run_action};
+use super::{is_admin, run_action};
 use crate::components::badge::Badge;
 use crate::components::icons::NavIcon;
 use crate::components::menu::{Menu, MenuItem};
+use crate::models::permission_editor::PermissionRequester;
 use crate::route::Route;
 use crate::server_fns;
 
@@ -20,12 +21,40 @@ pub use detail::ClientDetail;
 #[path = "clients/form.rs"]
 mod form;
 
+/// The account and permission policy a Clients page first loaded under.
+type Binding = (PermissionRequester, bool);
+
+/// Rejects a response for another account, organization or policy than the
+/// page is bound to, so a refresh never shows the previous identity's data.
+fn bind(mut binding: Signal<Option<Binding>>, current: Binding) -> Result<(), ServerFnError> {
+    if binding.peek().is_some_and(|expected| expected != current) {
+        return Err(ServerFnError::new(
+            "Your session or client policy changed. Reload this page to continue.",
+        ));
+    }
+    binding.set(Some(current));
+    Ok(())
+}
+
+/// A save reloads the page, unmounting the editor's opener before the dialog
+/// can return focus to it. Focus the rebuilt opener, unless the user has
+/// already moved focus beyond the dialog's fallback during the reload.
+fn restore_opener_focus(opener: &str, fallback: &str) {
+    let opener = serde_json::json!(opener);
+    let fallback = serde_json::json!(fallback);
+    document::eval(&format!(
+        "requestAnimationFrame(() => {{
+            const active = document.activeElement;
+            if (!active || active === document.body || active.id === {fallback}) {{
+                document.getElementById({opener})?.focus();
+            }}
+        }});"
+    ));
+}
+
 #[component]
 pub fn ClientList() -> Element {
     // Management view: include inactive clients so managers can reactivate them.
-    let mut clients = use_resource(|| async move { server_fns::list_client_summaries().await });
-    let me = use_resource(|| async move { server_fns::get_me().await });
-
     let mut query = use_signal(String::new);
     let mut scope = use_signal(ClientScope::default);
     let mut currency_filter = use_signal(String::new);
@@ -34,12 +63,49 @@ pub fn ClientList() -> Element {
     // `Some(id)` while editing an existing client, `None` while creating.
     let mut editing_id = use_signal(|| None::<Uuid>);
     let action_error = use_signal(|| None::<String>);
+    // The opener to refocus after a save's reload; see `restore_opener_focus`.
+    let mut refocus = use_signal(|| None::<String>);
 
-    let is_manager = is_manager(&me);
-    let can_import = is_admin(&me);
+    let binding = use_signal(|| None::<Binding>);
+    let mut clients = use_resource(move || async move {
+        // An editor opened under the previous authority must not survive a refresh.
+        editing_id.set(None);
+        show_form.set(false);
+        let expected = binding.peek().as_ref().map(|(requester, _)| *requester);
+        let overview = server_fns::client_overview(expected).await?;
+        bind(
+            binding,
+            (overview.requester, overview.canonical_permissions),
+        )?;
+        Ok::<_, ServerFnError>(overview)
+    });
+    let me = use_resource(|| async move { server_fns::get_me().await });
+    use_effect(move || {
+        if clients.state()() != UseResourceState::Ready {
+            return;
+        }
+        // One-shot: a failed, denied or rebound reload consumes it without focusing.
+        if let Some(opener) = refocus.take()
+            && matches!(&*clients.peek(), Some(Ok(overview)) if overview.can_manage)
+        {
+            restore_opener_focus(&opener, "clients-heading");
+        }
+    });
+
     let ready = clients.state()() == UseResourceState::Ready;
     let data = clients.read();
-    let list = data.as_ref().and_then(|result| result.as_ref().ok());
+    // A reloading resource keeps its previous value; never act on it.
+    let overview = ready
+        .then(|| data.as_ref().and_then(|result| result.as_ref().ok()))
+        .flatten();
+    // Client writes are not yet integrated with canonical permissions, so the
+    // server grants `can_manage` only to legacy-policy managers.
+    let is_manager = overview.is_some_and(|overview| overview.can_manage);
+    let can_import = is_manager && is_admin(&me);
+    let denied = overview.is_some_and(|overview| !overview.can_read);
+    let list = overview
+        .filter(|overview| overview.can_read)
+        .map(|overview| &overview.clients);
     let matching: Vec<_> = list
         .into_iter()
         .flatten()
@@ -83,6 +149,7 @@ pub fn ClientList() -> Element {
                 div { class: "page-actions items-center gap-4",
                     if is_manager {
                         button {
+                            id: "clients-new",
                             class: "btn btn-primary",
                             onclick: move |_| { editing_id.set(None); show_form.set(true); },
                             "New client"
@@ -128,7 +195,14 @@ pub fn ClientList() -> Element {
 
             form::ClientEditor { open: show_form() && is_manager, client_id: editing_id(), focus_fallback: "clients-heading",
                 on_dismiss: move |_| reset_form(),
-                on_saved: move |_| { reset_form(); clients.restart(); },
+                on_saved: move |_| {
+                    refocus.set(Some(match *editing_id.peek() {
+                        Some(id) => format!("client-edit-{id}"),
+                        None => "clients-new".to_owned(),
+                    }));
+                    reset_form();
+                    clients.restart();
+                },
             }
 
             if let Some(message) = action_error() {
@@ -139,9 +213,15 @@ pub fn ClientList() -> Element {
                 p { class: "text-sm text-secondary", role: "status", aria_busy: "true", "Loading clients…" }
             } else if let Some(Err(_)) = &*data {
                 div { class: "alert alert-danger", role: "alert",
-                    "Could not load clients. Retry to refresh the list. "
-                    button { r#type: "button", class: "btn btn-secondary btn-sm",
+                    "Could not load clients. Retry, or reload this page if your account changed. "
+                    button { id: "clients-retry", r#type: "button", class: "btn btn-secondary btn-sm",
                         onclick: move |_| clients.restart(), "Retry clients" }
+                }
+            } else if denied {
+                div { class: "empty-state rounded-xl",
+                    div { class: "empty-state-icon-tile", aria_hidden: "true", NavIcon { name: "clients" } }
+                    h2 { class: "empty-state-title text-xl m-0", "Client access is unavailable" }
+                    p { class: "empty-state-text m-0", "Your permissions do not include the client list." }
                 }
             } else if let Some(list) = list {
                 if visible.is_empty() {
@@ -205,6 +285,7 @@ pub fn ClientList() -> Element {
                                                     td {
                                                         div { class: "flex items-center gap-2",
                                                         button {
+                                                            id: "client-edit-{c.id}",
                                                             class: "btn btn-secondary btn-sm",
                                                             onclick: {
                                                                 let c = c.clone();
@@ -216,6 +297,7 @@ pub fn ClientList() -> Element {
                                                             "Edit"
                                                         }
                                                         button {
+                                                            id: "client-activity-{c.id}",
                                                             class: "btn btn-secondary btn-sm",
                                                             onclick: {
                                                                 let id = c.id;
